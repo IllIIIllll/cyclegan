@@ -1,72 +1,78 @@
-import numpy as np
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+
 import tensorflow as tf
-import tf2lib as tl
 
-def make_dataset(img_paths, batch_size, load_size, crop_size, training, drop_remainder=True, shuffle=True, repeat=1):
-    if training:
-        @tf.function
-        def _map_fn(img):
+class ImageData:
+    def __init__(self,
+                 session,
+                 image_paths,
+                 batch_size,
+                 load_size=286,
+                 crop_size=256,
+                 channels=3,
+                 prefetch_batch=2,
+                 drop_remainder=True,
+                 num_threads=16,
+                 shuffle=True,
+                 buffer_size=4096,
+                 repeat=-1):
+
+        self._sess = session
+        self._img_batch = ImageData._image_batch(image_paths,
+                                                 batch_size,
+                                                 load_size,
+                                                 crop_size,
+                                                 channels,
+                                                 prefetch_batch,
+                                                 drop_remainder,
+                                                 num_threads,
+                                                 shuffle,
+                                                 buffer_size,
+                                                 repeat)
+        self._img_num = len(image_paths)
+
+    def __len__(self):
+        return self._img_num
+
+    def batch(self):
+        return self._sess.run(self._img_batch)
+
+    @staticmethod
+    def _image_batch(image_paths,
+                     batch_size,
+                     load_size=286,
+                     crop_size=256,
+                     channels=3,
+                     prefetch_batch=2,
+                     drop_remainder=True,
+                     num_threads=16,
+                     shuffle=True,
+                     buffer_size=4096,
+                     repeat=-1):
+        def _parse_func(path):
+            img = tf.read_file(path)
+            img = tf.image.decode_jpeg(img, channels=channels)
             img = tf.image.random_flip_left_right(img)
-            img = tf.image.resize(img, [load_size, load_size])
-            img = tf.image.random_crop(img, [crop_size, crop_size, tf.shape(img)[-1]])
-            img = tf.clip_by_value(img, 0, 255) / 255.0
-            img = img * 2 - 1
-            return img
-    else:
-        @tf.function
-        def _map_fn(img):
-            img = tf.image.resize(img, [crop_size, crop_size])
-            img = tf.clip_by_value(img, 0, 255) / 255.0
+            img = tf.image.resize_images(img, [load_size, load_size])
+            img = (img - tf.reduce_min(img)) / (tf.reduce_max(img) - tf.reduce_min(img))
+            img = tf.random_crop(img, [crop_size, crop_size, channels])
             img = img * 2 - 1
             return img
 
-    return tl.disk_image_batch_dataset(img_paths,
-                                       batch_size,
-                                       drop_remainder=drop_remainder,
-                                       map_fn=_map_fn,
-                                       shuffle=shuffle,
-                                       repeat=repeat)
+        dataset = tf.data.Dataset.from_tensor_slices(image_paths)
 
-def make_zip_dataset(A_img_paths, B_img_paths, batch_size, load_size, crop_size, training, shuffle=True, repeat=False):
-    if repeat:
-        A_repeat = B_repeat = None
-    else:
-        if len(A_img_paths) >= len(B_img_paths):
-            A_repeat = 1
-            B_repeat = None
+        dataset = dataset.map(_parse_func, num_parallel_calls=num_threads)
+
+        if shuffle:
+            dataset = dataset.shuffle(buffer_size)
+
+        if drop_remainder:
+            dataset = dataset.apply(tf.contrib.data.batch_and_drop_remainder(batch_size))
         else:
-            A_repeat = None
-            B_repeat = 1
+            dataset = dataset.batch(batch_size)
 
-    A_dataset = make_dataset(A_img_paths, batch_size, load_size, crop_size, training, drop_remainder=True, shuffle=shuffle, repeat=A_repeat)
-    B_dataset = make_dataset(B_img_paths, batch_size, load_size, crop_size, training, drop_remainder=True, shuffle=shuffle, repeat=B_repeat)
+        dataset = dataset.repeat(repeat).prefetch(prefetch_batch)
 
-    A_B_dataset = tf.data.Dataset.zip((A_dataset, B_dataset))
-    len_dataset = max(len(A_img_paths), len(B_img_paths)) // batch_size
-
-    return A_B_dataset, len_dataset
-
-class ItemPool:
-
-    def __init__(self, pool_size=50):
-        self.pool_size = pool_size
-        self.items = []
-
-    def __call__(self, in_items):
-
-        if self.pool_size == 0:
-            return in_items
-
-        out_items = []
-        for in_item in in_items:
-            if len(self.items) < self.pool_size:
-                self.items.append(in_item)
-                out_items.append(in_item)
-            else:
-                if np.random.rand() > 0.5:
-                    idx = np.random.randint(0, len(self.items))
-                    out_item, self.items[idx] = self.items[idx], in_item
-                    out_items.append(out_item)
-                else:
-                    out_items.append(in_item)
-        return tf.stack(out_items, axis=0)
+        return dataset.make_one_shot_iterator().get_next()

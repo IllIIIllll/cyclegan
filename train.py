@@ -1,178 +1,156 @@
-import functools
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
 
-import imlib as im
-import numpy as np
-import pylib as py
-import tensorflow as tf
-import keras as keras
-import tf2lib as tl
-import tf2gan as gan
-import tqdm
+import argparse
+from functools import partial
+from glob import glob
 
 import data
-import module
+import image_utils as im
+import models
+import numpy as np
+import tensorflow as tf
+import utils
 
-py.arg('--dataset', default='horse2zebra')
-py.arg('--datasets_dir', default='datasets')
-py.arg('--load_size', type=int, default=286)
-py.arg('--crop_size', type=int, default=256)
-py.arg('--batch_size', type=int, default=1)
-py.arg('--epochs', type=int, default=200)
-py.arg('--epoch_decay', type=int, default=100)
-py.arg('--lr', type=float, default=0.0002)
-py.arg('--beta_1', type=float, default=0.5)
-py.arg('--adversarial_loss_mode', default='lsgan', choices=['gan', 'hinge_v1', 'hinge_v2', 'lsgan', 'wgan'])
-py.arg('--gradient_penalty_mode', default='none', choices=['none', 'dragan', 'wgan-gp'])
-py.arg('--gradient_penalty_weight', type=float, default=10.0)
-py.arg('--cycle_loss_weight', type=float, default=10.0)
-py.arg('--identity_loss_weight', type=float, default=0.0)
-py.arg('--pool_size', type=int, default=50)
-args = py.args()
+parser = argparse.ArgumentParser(description='')
+parser.add_argument('--dataset', dest='dataset', default='horse2zebra')
+parser.add_argument('--load_size', dest='load_size', type=int, default=286)
+parser.add_argument('--crop_size', dest='crop_size', type=int, default=256)
+parser.add_argument('--epoch', dest='epoch', type=int, default=200)
+parser.add_argument('--batch_size', dest='batch_size', type=int, default=1)
+parser.add_argument('--lr', dest='lr', type=float, default=0.0002)
+args = parser.parse_args()
 
-output_dir = py.join('output', args.dataset)
-py.mkdir(output_dir)
+dataset = args.dataset
+load_size = args.load_size
+crop_size = args.crop_size
+epoch = args.epoch
+batch_size = args.batch_size
+lr = args.lr
 
-py.args_to_yaml(py.join(output_dir, 'settings.yml'), args)
+generator_a2b = partial(models.generator, scope='a2b')
+generator_b2a = partial(models.generator, scope='b2a')
+discriminator_a = partial(models.discriminator, scope='a')
+discriminator_b = partial(models.discriminator, scope='b')
 
-A_img_paths = py.glob(py.join(args.datasets_dir, args.dataset, 'trainA'), '*.jpg')
-B_img_paths = py.glob(py.join(args.datasets_dir, args.dataset, 'trainB'), '*.jpg')
-A_B_dataset, len_dataset = data.make_zip_dataset(A_img_paths, B_img_paths, args.batch_size, args.load_size, args.crop_size, training=True, repeat=False)
+a_real = tf.placeholder(tf.float32, shape=[None, crop_size, crop_size, 3])
+b_real = tf.placeholder(tf.float32, shape=[None, crop_size, crop_size, 3])
+a2b_sample = tf.placeholder(tf.float32, shape=[None, crop_size, crop_size, 3])
+b2a_sample = tf.placeholder(tf.float32, shape=[None, crop_size, crop_size, 3])
 
-A2B_pool = data.ItemPool(args.pool_size)
-B2A_pool = data.ItemPool(args.pool_size)
+a2b = generator_a2b(a_real)
+b2a = generator_b2a(b_real)
+b2a2b = generator_a2b(b2a)
+a2b2a = generator_b2a(a2b)
 
-A_img_paths_test = py.glob(py.join(args.datasets_dir, args.dataset, 'testA'), '*.jpg')
-B_img_paths_test = py.glob(py.join(args.datasets_dir, args.dataset, 'testB'), '*.jpg')
-A_B_dataset_test, _ = data.make_zip_dataset(A_img_paths_test, B_img_paths_test, args.batch_size, args.load_size, args.crop_size, training=False, repeat=True)
+a_logit = discriminator_a(a_real)
+b2a_logit = discriminator_a(b2a)
+b2a_sample_logit = discriminator_a(b2a_sample)
+b_logit = discriminator_b(b_real)
+a2b_logit = discriminator_b(a2b)
+a2b_sample_logit = discriminator_b(a2b_sample)
 
-G_A2B = module.ResnetGenerator(input_shape=(args.crop_size, args.crop_size, 3))
-G_B2A = module.ResnetGenerator(input_shape=(args.crop_size, args.crop_size, 3))
+g_loss_a2b = tf.losses.mean_squared_error(a2b_logit, tf.ones_like(a2b_logit))
+g_loss_b2a = tf.losses.mean_squared_error(b2a_logit, tf.ones_like(b2a_logit))
+cyc_loss_a = tf.losses.absolute_difference(a_real, a2b2a)
+cyc_loss_b = tf.losses.absolute_difference(b_real, b2a2b)
+g_loss = g_loss_a2b + g_loss_b2a + cyc_loss_a * 10.0 + cyc_loss_b * 10.0
 
-D_A = module.ConvDiscriminator(input_shape=(args.crop_size, args.crop_size, 3))
-D_B = module.ConvDiscriminator(input_shape=(args.crop_size, args.crop_size, 3))
+d_loss_a_real = tf.losses.mean_squared_error(a_logit, tf.ones_like(a_logit))
+d_loss_b2a_sample = tf.losses.mean_squared_error(b2a_sample_logit, tf.zeros_like(b2a_sample_logit))
+d_loss_a = d_loss_a_real + d_loss_b2a_sample
 
-d_loss_fn, g_loss_fn = gan.get_adversarial_losses_fn(args.adversarial_loss_mode)
-cycle_loss_fn = tf.losses.MeanAbsoluteError()
-identity_loss_fn = tf.losses.MeanAbsoluteError()
+d_loss_b_real = tf.losses.mean_squared_error(b_logit, tf.ones_like(b_logit))
+d_loss_a2b_sample = tf.losses.mean_squared_error(a2b_sample_logit, tf.zeros_like(a2b_sample_logit))
+d_loss_b = d_loss_b_real + d_loss_a2b_sample
 
-G_lr_scheduler = module.LinearDecay(args.lr, args.epochs * len_dataset, args.epoch_decay * len_dataset)
-D_lr_scheduler = module.LinearDecay(args.lr, args.epochs * len_dataset, args.epoch_decay * len_dataset)
-G_optimizer = keras.optimizers.Adam(learning_rate=G_lr_scheduler, beta_1=args.beta_1)
-D_optimizer = keras.optimizers.Adam(learning_rate=D_lr_scheduler, beta_1=args.beta_1)
+g_summary = utils.summary({g_loss_a2b: 'g_loss_a2b',
+                           g_loss_b2a: 'g_loss_b2a',
+                           cyc_loss_a: 'cyc_loss_a',
+                           cyc_loss_b: 'cyc_loss_b'})
+d_summary_a = utils.summary({d_loss_a: 'd_loss_a'})
+d_summary_b = utils.summary({d_loss_b: 'd_loss_b'})
 
-@tf.function
-def train_G(A, B):
-    with tf.GradientTape() as t:
-        A2B = G_A2B(A, training=True)
-        B2A = G_B2A(B, training=True)
-        A2B2A = G_B2A(A2B, training=True)
-        B2A2B = G_A2B(B2A, training=True)
-        A2A = G_B2A(A, training=True)
-        B2B = G_A2B(B, training=True)
+t_var = tf.trainable_variables()
+d_a_var = [var for var in t_var if 'a_discriminator' in var.name]
+d_b_var = [var for var in t_var if 'b_discriminator' in var.name]
+g_var = [var for var in t_var if 'a2b_generator' in var.name or 'b2a_generator' in var.name]
 
-        A2B_d_logits = D_B(A2B, training=True)
-        B2A_d_logits = D_A(B2A, training=True)
+d_a_train_op = tf.train.AdamOptimizer(lr, beta1=0.5).minimize(d_loss_a, var_list=d_a_var)
+d_b_train_op = tf.train.AdamOptimizer(lr, beta1=0.5).minimize(d_loss_b, var_list=d_b_var)
+g_train_op = tf.train.AdamOptimizer(lr, beta1=0.5).minimize(g_loss, var_list=g_var)
 
-        A2B_g_loss = g_loss_fn(A2B_d_logits)
-        B2A_g_loss = g_loss_fn(B2A_d_logits)
-        A2B2A_cycle_loss = cycle_loss_fn(A, A2B2A)
-        B2A2B_cycle_loss = cycle_loss_fn(B, B2A2B)
-        A2A_id_loss = identity_loss_fn(A, A2A)
-        B2B_id_loss = identity_loss_fn(B, B2B)
+config = tf.ConfigProto(allow_soft_placement=True)
+config.gpu_options.allow_growth = True
+sess = tf.Session(config=config)
 
-        G_loss = (A2B_g_loss + B2A_g_loss) + (A2B2A_cycle_loss + B2A2B_cycle_loss) * args.cycle_loss_weight + (A2A_id_loss + B2B_id_loss) * args.identity_loss_weight
+it_cnt, update_cnt = utils.counter()
 
-    G_grad = t.gradient(G_loss, G_A2B.trainable_variables + G_B2A.trainable_variables)
-    G_optimizer.apply_gradients(zip(G_grad, G_A2B.trainable_variables + G_B2A.trainable_variables))
+a_img_paths = glob('./datasets/' + dataset + '/trainA/*.jpg')
+b_img_paths = glob('./datasets/' + dataset + '/trainB/*.jpg')
+a_data_pool = data.ImageData(sess, a_img_paths, batch_size, load_size=load_size, crop_size=crop_size)
+b_data_pool = data.ImageData(sess, b_img_paths, batch_size, load_size=load_size, crop_size=crop_size)
 
-    return A2B, B2A, {'A2B_g_loss': A2B_g_loss,
-                      'B2A_g_loss': B2A_g_loss,
-                      'A2B2A_cycle_loss': A2B2A_cycle_loss,
-                      'B2A2B_cycle_loss': B2A2B_cycle_loss,
-                      'A2A_id_loss': A2A_id_loss,
-                      'B2B_id_loss': B2B_id_loss}
+a_test_img_paths = glob('./datasets/' + dataset + '/testA/*.jpg')
+b_test_img_paths = glob('./datasets/' + dataset + '/testB/*.jpg')
+a_test_pool = data.ImageData(sess, a_test_img_paths, batch_size, load_size=load_size, crop_size=crop_size)
+b_test_pool = data.ImageData(sess, b_test_img_paths, batch_size, load_size=load_size, crop_size=crop_size)
 
-@tf.function
-def train_D(A, B, A2B, B2A):
-    with tf.GradientTape() as t:
-        A_d_logits = D_A(A, training=True)
-        B2A_d_logits = D_A(B2A, training=True)
-        B_d_logits = D_B(B, training=True)
-        A2B_d_logits = D_B(A2B, training=True)
+a2b_pool = utils.ItemPool()
+b2a_pool = utils.ItemPool()
 
-        A_d_loss, B2A_d_loss = d_loss_fn(A_d_logits, B2A_d_logits)
-        B_d_loss, A2B_d_loss = d_loss_fn(B_d_logits, A2B_d_logits)
-        D_A_gp = gan.gradient_penalty(functools.partial(D_A, training=True), A, B2A, mode=args.gradient_penalty_mode)
-        D_B_gp = gan.gradient_penalty(functools.partial(D_B, training=True), B, A2B, mode=args.gradient_penalty_mode)
+summary_writer = tf.summary.FileWriter('./outputs/summaries/' + dataset, sess.graph)
 
-        D_loss = (A_d_loss + B2A_d_loss) + (B_d_loss + A2B_d_loss) + (D_A_gp + D_B_gp) * args.gradient_penalty_weight
+saver = tf.train.Saver(max_to_keep=5)
 
-    D_grad = t.gradient(D_loss, D_A.trainable_variables + D_B.trainable_variables)
-    D_optimizer.apply_gradients(zip(D_grad, D_A.trainable_variables + D_B.trainable_variables))
-
-    return {'A_d_loss': A_d_loss + B2A_d_loss,
-            'B_d_loss': B_d_loss + A2B_d_loss,
-            'D_A_gp': D_A_gp,
-            'D_B_gp': D_B_gp}
-
-def train_step(A, B):
-    A2B, B2A, G_loss_dict = train_G(A, B)
-
-    A2B = A2B_pool(A2B)
-    B2A = B2A_pool(B2A)
-
-    D_loss_dict = train_D(A, B, A2B, B2A)
-
-    return G_loss_dict, D_loss_dict
-
-@tf.function
-def sample(A, B):
-    A2B = G_A2B(A, training=False)
-    B2A = G_B2A(B, training=False)
-    A2B2A = G_B2A(A2B, training=False)
-    B2A2B = G_A2B(B2A, training=False)
-    return A2B, B2A, A2B2A, B2A2B
-
-ep_cnt = tf.Variable(initial_value=0, trainable=False, dtype=tf.int64)
-
-checkpoint = tl.Checkpoint(dict(G_A2B=G_A2B,
-                                G_B2A=G_B2A,
-                                D_A=D_A,
-                                D_B=D_B,
-                                G_optimizer=G_optimizer,
-                                D_optimizer=D_optimizer,
-                                ep_cnt=ep_cnt),
-                           py.join(output_dir, 'checkpoints'),
-                           max_to_keep=5)
+ckpt_dir = './outputs/checkpoints/' + dataset
+utils.mkdir(ckpt_dir)
 try:
-    checkpoint.restore().assert_existing_objects_matched()
-except Exception as e:
-    print(e)
+    utils.load_checkpoint(ckpt_dir, sess)
+except:
+    sess.run(tf.global_variables_initializer())
 
-train_summary_writer = tf.summary.create_file_writer(py.join(output_dir, 'summaries', 'train'))
+try:
+    batch_epoch = min(len(a_data_pool), len(b_data_pool)) // batch_size
+    max_it = epoch * batch_epoch
+    for it in range(sess.run(it_cnt), max_it):
+        sess.run(update_cnt)
+        epoch = it // batch_epoch
+        it_epoch = it % batch_epoch + 1
 
-test_iter = iter(A_B_dataset_test)
-sample_dir = py.join(output_dir, 'samples_training')
-py.mkdir(sample_dir)
+        a_real_ipt = a_data_pool.batch()
+        b_real_ipt = b_data_pool.batch()
+        a2b_opt, b2a_opt = sess.run([a2b, b2a], feed_dict={a_real: a_real_ipt, b_real: b_real_ipt})
+        a2b_sample_ipt = np.array(a2b_pool(list(a2b_opt)))
+        b2a_sample_ipt = np.array(b2a_pool(list(b2a_opt)))
 
-with train_summary_writer.as_default():
-    for ep in tqdm.trange(args.epochs, desc='Epoch Loop'):
-        if ep < ep_cnt:
-            continue
+        g_summary_opt, _ = sess.run([g_summary, g_train_op], feed_dict={a_real: a_real_ipt, b_real: b_real_ipt})
+        summary_writer.add_summary(g_summary_opt, it)
 
-        ep_cnt.assign_add(1)
+        d_summary_b_opt, _ = sess.run([d_summary_b, d_b_train_op], feed_dict={b_real: b_real_ipt, a2b_sample: a2b_sample_ipt})
+        summary_writer.add_summary(d_summary_b_opt, it)
 
-        for A, B in tqdm.tqdm(A_B_dataset, desc='Inner Epoch Loop', total=len_dataset):
-            G_loss_dict, D_loss_dict = train_step(A, B)
+        d_summary_a_opt, _ = sess.run([d_summary_a, d_a_train_op], feed_dict={a_real: a_real_ipt, b2a_sample: b2a_sample_ipt})
+        summary_writer.add_summary(d_summary_a_opt, it)
 
-            tl.summary(G_loss_dict, step=G_optimizer.iterations, name='G_losses')
-            tl.summary(D_loss_dict, step=G_optimizer.iterations, name='D_losses')
-            tl.summary({'learning rate': G_lr_scheduler.current_learning_rate}, step=G_optimizer.iterations, name='learning rate')
+        if it % 1 == 0:
+            print(f'Epoch: ({epoch}) ({it_epoch}/{batch_epoch})')
 
-            if G_optimizer.iterations.numpy() % 100 == 0:
-                A, B = next(test_iter)
-                A2B, B2A, A2B2A, B2A2B = sample(A, B)
-                img = im.immerge(np.concatenate([A, A2B, A2B2A, B, B2A, B2A2B], axis=0), n_rows=2)
-                im.imwrite(img, py.join(sample_dir, 'iter-%09d.jpg' % G_optimizer.iterations.numpy()))
+        if (it + 1) % 1000 == 0:
+            save_path = saver.save(sess, f'{ckpt_dir}/Epoch_({epoch})_({it_epoch}of{batch_epoch}).ckpt')
+            print(f'Model saved in file: {save_path}')
 
-        checkpoint.save(ep)
+        if (it + 1) % 100 == 0:
+            a_real_ipt = a_test_pool.batch()
+            b_real_ipt = b_test_pool.batch()
+            [a2b_opt, a2b2a_opt, b2a_opt, b2a2b_opt] = sess.run([a2b, a2b2a, b2a, b2a2b], feed_dict={a_real: a_real_ipt, b_real: b_real_ipt})
+            sample_opt = np.concatenate((a_real_ipt, a2b_opt, a2b2a_opt, b_real_ipt, b2a_opt, b2a2b_opt), axis=0)
+
+            save_dir = './outputs/sample_images_while_training/' + dataset
+            utils.mkdir(save_dir)
+            im.imwrite(im.immerge(sample_opt, 2, 3), f'{save_dir}/Epoch_({epoch})_({it_epoch}of{batch_epoch}).jpg')
+except:
+    save_path = saver.save(sess, f'{ckpt_dir}/Epoch_({epoch})_({it_epoch}of{batch_epoch}).ckpt')
+    print(f'Model saved in file: {save_path}')
+    sess.close()

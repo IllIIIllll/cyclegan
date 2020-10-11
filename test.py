@@ -1,58 +1,60 @@
-import imlib as im
+from __future__ import absolute_import, division, print_function
+
+import argparse
+from glob import glob
+import os
+
+import image_utils as im
+import models
 import numpy as np
-import pylib as py
 import tensorflow as tf
-import tf2lib as tl
+import utils
 
-import data
-import module
+parser = argparse.ArgumentParser(description='')
+parser.add_argument('--dataset', dest='dataset', default='horse2zebra')
+parser.add_argument('--crop_size', dest='crop_size', type=int, default=256)
+args = parser.parse_args()
 
-py.arg('--experiment_dir')
-py.arg('--batch_size', type=int, default=32)
-test_args = py.args()
-args = py.args_from_yaml(py.join(test_args.experiment_dir, 'settings.yml'))
-args.__dict__.update(test_args.__dict__)
+dataset = args.dataset
+crop_size = args.crop_size
 
-A_img_paths_test = py.glob(py.join(args.datasets_dir, args.dataset, 'testA'), '*.jpg')
-B_img_paths_test = py.glob(py.join(args.datasets_dir, args.dataset, 'testB'), '*.jpg')
-A_dataset_test = data.make_dataset(A_img_paths_test, args.batch_size, args.load_size, args.crop_size,
-                                   training=False, drop_remainder=False, shuffle=False, repeat=1)
-B_dataset_test = data.make_dataset(B_img_paths_test, args.batch_size, args.load_size, args.crop_size,
-                                   training=False, drop_remainder=False, shuffle=False, repeat=1)
+with tf.Session() as sess:
+    a_real = tf.placeholder(tf.float32, shape=[None, crop_size, crop_size, 3])
+    b_real = tf.placeholder(tf.float32, shape=[None, crop_size, crop_size, 3])
 
-G_A2B = module.ResnetGenerator(input_shape=(args.crop_size, args.crop_size, 3))
-G_B2A = module.ResnetGenerator(input_shape=(args.crop_size, args.crop_size, 3))
+    a2b = models.generator(a_real, 'a2b')
+    b2a = models.generator(b_real, 'b2a')
+    b2a2b = models.generator(b2a, 'a2b')
+    a2b2a = models.generator(a2b, 'b2a')
 
-tl.Checkpoint(dict(G_A2B=G_A2B, G_B2A=G_B2A), py.join(args.experiment_dir, 'checkpoints')).restore()
+    try:
+        ckpt_path = utils.load_checkpoint('./outputs/checkpoints/' + dataset, sess)
+    except:
+        raise Exception('No checkpoint!')
 
-@tf.function
-def sample_A2B(A):
-    A2B = G_A2B(A, training=False)
-    A2B2A = G_B2A(A2B, training=False)
-    return A2B, A2B2A
+    a_list = glob('./datasets/' + dataset + '/testA/*.jpg')
+    b_list = glob('./datasets/' + dataset + '/testB/*.jpg')
 
-@tf.function
-def sample_B2A(B):
-    B2A = G_B2A(B, training=False)
-    B2A2B = G_A2B(B2A, training=False)
-    return B2A, B2A2B
+    a_save_dir = './outputs/test_predictions/' + dataset + '/testA'
+    b_save_dir = './outputs/test_predictions/' + dataset + '/testB'
+    utils.mkdir([a_save_dir, b_save_dir])
 
-save_dir = py.join(args.experiment_dir, 'samples_testing', 'A2B')
-py.mkdir(save_dir)
-i = 0
-for A in A_dataset_test:
-    A2B, A2B2A = sample_A2B(A)
-    for A_i, A2B_i, A2B2A_i in zip(A, A2B, A2B2A):
-        img = np.concatenate([A_i.numpy(), A2B_i.numpy(), A2B2A_i.numpy()], axis=1)
-        im.imwrite(img, py.join(save_dir, py.name_ext(A_img_paths_test[i])))
-        i += 1
+    for i in range(len(a_list)):
+        a_real_ipt = im.imresize(im.imread(a_list[i]), [crop_size, crop_size])
+        a_real_ipt.shape = 1, crop_size, crop_size, 3
+        a2b_opt, a2b2a_opt = sess.run([a2b, a2b2a], feed_dict={a_real: a_real_ipt})
+        a_img_opt = np.concatenate((a_real_ipt, a2b_opt, a2b2a_opt), axis=0)
 
-save_dir = py.join(args.experiment_dir, 'samples_testing', 'B2A')
-py.mkdir(save_dir)
-i = 0
-for B in B_dataset_test:
-    B2A, B2A2B = sample_B2A(B)
-    for B_i, B2A_i, B2A2B_i in zip(B, B2A, B2A2B):
-        img = np.concatenate([B_i.numpy(), B2A_i.numpy(), B2A2B_i.numpy()], axis=1)
-        im.imwrite(img, py.join(save_dir, py.name_ext(B_img_paths_test[i])))
-        i += 1
+        img_name = os.path.basename(a_list[i])
+        im.imwrite(im.immerge(a_img_opt, 1, 3), a_save_dir + '/' + img_name)
+        print(f'Save {a_save_dir + "/" + img_name}')
+
+    for i in range(len(b_list)):
+        b_real_ipt = im.imresize(im.imread(b_list[i]), [crop_size, crop_size])
+        b_real_ipt.shape = 1, crop_size, crop_size, 3
+        b2a_opt, b2a2b_opt = sess.run([b2a, b2a2b], feed_dict={b_real: b_real_ipt})
+        b_img_opt = np.concatenate((b_real_ipt, b2a_opt, b2a2b_opt), axis=0)
+
+        img_name = os.path.basename(b_list[i])
+        im.imwrite(im.immerge(b_img_opt, 1, 3), b_save_dir + '/' + img_name)
+        print(f'Save {b_save_dir + "/" + img_name}')
