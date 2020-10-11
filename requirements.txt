@@ -1,5 +1,6 @@
 tensorflow-gpu==1.15.0
 tensorflow-addons
+scipy==1.2.1
 oyaml
 tqdm
 scikit-image
