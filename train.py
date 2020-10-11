@@ -4,7 +4,7 @@ import imlib as im
 import numpy as np
 import pylib as py
 import tensorflow as tf
-import tensorflow.keras as keras
+import keras as keras
 import tf2lib as tl
 import tf2gan as gan
 import tqdm

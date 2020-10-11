@@ -1,6 +1,6 @@
 import tensorflow as tf
 import tensorflow_addons as tfa
-import tensorflow.keras as keras
+import keras as keras
 
 def _get_norm_layer(norm):
     if norm == 'none':
