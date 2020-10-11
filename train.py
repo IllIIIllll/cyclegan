@@ -18,7 +18,7 @@ parser.add_argument('--dataset', dest='dataset', default='horse2zebra')
 parser.add_argument('--load_size', dest='load_size', type=int, default=286)
 parser.add_argument('--crop_size', dest='crop_size', type=int, default=256)
 parser.add_argument('--epoch', dest='epoch', type=int, default=200)
-parser.add_argument('--batch_size', dest='batch_size', type=int, default=1)
+parser.add_argument('--batch_size', dest='batch_size', type=int, default=8)
 parser.add_argument('--lr', dest='lr', type=float, default=0.0002)
 args = parser.parse_args()
 
